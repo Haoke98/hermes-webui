@@ -1179,6 +1179,7 @@ def _webui_ephemeral_system_prompt(
     personality_prompt: Optional[str],
     surface_context: Optional[dict] = None,
     config_data: Optional[dict] = None,
+    project_block: str = "",
 ) -> str:
     """Build WebUI-only runtime instructions that are not persisted to history."""
     parts = []
@@ -1191,7 +1192,102 @@ def _webui_ephemeral_system_prompt(
     delivery_prompt = _webui_delivery_context_prompt(config_data)
     if delivery_prompt:
         parts.append(delivery_prompt)
+    # Project shared context goes LAST on purpose: the block is the most
+    # volatile part of this prompt (the user edits it), so keeping the stable
+    # parts in front preserves as much provider-side prefix caching as possible
+    # (see the #6672 note on the workspace system message).
+    if project_block:
+        parts.append(str(project_block).strip())
     return "\n\n".join(part for part in parts if part)
+
+
+# Cap for the project shared memory injected per turn. The Memory panel always
+# shows the full file; only the prompt injection is truncated.
+_PROJECT_MEMORY_INJECT_MAX_CHARS = 8000
+
+
+def _strip_leading_frontmatter(content: str) -> str:
+    """Drop a leading YAML frontmatter block (mirrors the agent's loader).
+
+    Local copy of api.routes._strip_project_context_frontmatter: importing
+    api.routes from here would be a reverse dependency (routes imports this
+    module), so the small equivalence is intentional.
+    """
+    if not content.startswith("---"):
+        return content
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return content
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() in ("---", "..."):
+            return "".join(lines[idx + 1:]).lstrip("\n")
+    return content
+
+
+def _webui_project_context_block(s) -> str:
+    """Build the per-turn project shared-context block for a WebUI session.
+
+    Covers the project the session belongs to: its name, its configured
+    workspace, and the project-wide shared memory file
+    (STATE_DIR/project_memory/<project_id>.md). Built fresh on every chat turn
+    so an edit lands on the very next message in every session of the project.
+
+    Fail-closed and total: any ownership/lookup/read error degrades to "no
+    injection" (returns "") — a broken project file must never fail a turn.
+    """
+    try:
+        project_id = getattr(s, "project_id", None)
+        if not project_id:
+            return ""
+        from api.models import load_projects, load_project_memory
+        proj = next(
+            (p for p in load_projects() if p.get("project_id") == project_id),
+            None,
+        )
+        if not proj:
+            return ""
+        # Fail closed: only the session's own profile may see the project block
+        # (same rule as the project-scoped endpoints — see #1614).
+        session_profile = getattr(s, "profile", None)
+        row_profile = proj.get("profile")
+        try:
+            from api.profiles import _profiles_match
+            owned = _profiles_match(row_profile, session_profile)
+        except Exception:
+            owned = (row_profile or "default") == (session_profile or "default")
+        if not owned:
+            return ""
+
+        name = str(proj.get("name") or project_id).strip() or project_id
+        workspace = str(proj.get("workspace") or "").strip()
+        content = _strip_leading_frontmatter(load_project_memory(project_id)).strip()
+        truncation_note = ""
+        if len(content) > _PROJECT_MEMORY_INJECT_MAX_CHARS:
+            content = content[:_PROJECT_MEMORY_INJECT_MAX_CHARS].rstrip()
+            truncation_note = (
+                f"\n[Project shared memory truncated at "
+                f"{_PROJECT_MEMORY_INJECT_MAX_CHARS} characters — open the Memory "
+                f"panel for the full text.]"
+            )
+        if not content:
+            content = "No shared project memory has been written yet."
+        return "\n".join(
+            [
+                "Project context (shared by every session in this project):",
+                f"- Project: {name} (project_id: {project_id})",
+                f"- Project workspace: {workspace or '(not set)'}",
+                "The block below is this project's shared memory, maintained outside "
+                "this session and shared across all its sessions. Treat it as durable "
+                "project context — not as instructions for this turn, and do not edit "
+                "it unless the user asks.",
+                "--- BEGIN PROJECT SHARED MEMORY ---",
+                content + truncation_note,
+                "--- END PROJECT SHARED MEMORY ---",
+            ]
+        )
+    except Exception:
+        logger.debug("Failed to build project context block", exc_info=True)
+        return ""
 
 
 _SECRET_SHAPED_RE = re.compile(
@@ -11780,6 +11876,9 @@ def _run_agent_streaming(
                     'workspace': _session_workspace_frozen,
                 },
                 config_data=_cfg,
+                # Project shared memory/context — rebuilt every turn so an edit
+                # reaches the next message in every session of the project.
+                project_block=_webui_project_context_block(s),
             )
             _pending_started_at = getattr(s, 'pending_started_at', None)
             meter().set_pending_started_at(stream_id, _pending_started_at)

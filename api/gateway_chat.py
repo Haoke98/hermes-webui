@@ -1268,6 +1268,7 @@ def _run_gateway_chat_streaming(
                 _normalize_prefill_messages_before_user_turn,
                 _public_prefill_context_status,
                 _webui_ephemeral_system_prompt,
+                _webui_project_context_block,
             )
 
             prefill_context = _load_webui_prefill_context(cfg)
@@ -1285,6 +1286,10 @@ def _run_gateway_chat_streaming(
                     "workspace": s.workspace if s is not None else str(workspace),
                 },
                 config_data=cfg,
+                # Project shared memory/context: the gateway-routed backend must
+                # build the SAME system prompt (see _run_agent_streaming), or
+                # project memory silently stops working when the gateway is used.
+                project_block=_webui_project_context_block(s),
             )
             prefill_messages = _prefill_messages_with_webui_context(prefill_context, cfg)
             prefill_messages = _normalize_prefill_messages_before_user_turn(prefill_messages)
