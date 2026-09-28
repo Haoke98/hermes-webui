@@ -32,7 +32,8 @@ import api.config as _cfg
 from api.compression_anchor import is_context_compression_marker
 from api.config import (
     SESSION_DIR, SESSION_INDEX_FILE, SESSIONS, SESSIONS_MAX,
-    LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
+    LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE,
+    PROJECT_MEMORY_DIR, HOME,
     get_effective_default_model, _get_session_agent_lock,
 )
 from api.workspace import get_last_workspace, _resolve_path, profile_home_resolve_cache_scope
@@ -5702,7 +5703,7 @@ def _profile_default_model_state(profile=None):
     return default_model or get_effective_default_model(), default_provider
 
 
-def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):
+def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None, personality=None):
     """Create a new in-memory session.
 
     The session lives in the SESSIONS dict only — no disk write happens until
@@ -5750,7 +5751,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         model_provider=effective_model_provider,
         profile=profile,
         project_id=project_id,
-        personality=None,
+        personality=personality,
         worktree_path=wt.get('path') if wt else None,
         worktree_branch=wt.get('branch') if wt else None,
         worktree_repo_root=wt.get('repo_root') if wt else None,
@@ -7286,6 +7287,121 @@ def load_projects(*, _migrate: bool = True) -> list:
 def save_projects(projects) -> None:
     """Write project list to disk."""
     PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+# ── Project shared memory ────────────────────────────────────────────────────
+#
+# One UTF-8 Markdown file per project at ``PROJECT_MEMORY_DIR/<project_id>.md``.
+# Every session that belongs to the project gets the content injected into its
+# per-turn ephemeral system prompt (api/streaming.py), so all sessions in the
+# project share one durable note. The project id is always server-generated
+# (``uuid4().hex[:12]``) and re-validated here before it is ever joined onto a
+# path, so a client-supplied id can never traverse out of the store directory.
+
+PROJECT_ID_SAFE_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def is_safe_project_id(project_id) -> bool:
+    """Return True when *project_id* matches the server-generated id shape."""
+    if project_id is None:
+        return False
+    return bool(PROJECT_ID_SAFE_RE.fullmatch(str(project_id)))
+
+
+def project_memory_path(project_id) -> Path:
+    """Return the on-disk path of a project's shared memory file.
+
+    Raises ``ValueError`` for ids that do not match the server-generated shape;
+    callers must validate before touching the filesystem (fail closed).
+    """
+    pid = "" if project_id is None else str(project_id)
+    if not PROJECT_ID_SAFE_RE.fullmatch(pid):
+        raise ValueError("invalid project_id")
+    return PROJECT_MEMORY_DIR / f"{pid}.md"
+
+
+def find_project(project_id, *, profile=None, projects=None) -> dict | None:
+    """Return the project dict for *project_id*, or None.
+
+    When *profile* is given the lookup is scoped to projects owned by that
+    profile (same rule as ``GET /api/projects``), so a foreign project id reads
+    as "not found" instead of leaking the row.
+    """
+    pid = "" if project_id is None else str(project_id)
+    if not pid:
+        return None
+    if projects is None:
+        projects = load_projects()
+    proj = next((p for p in projects if p.get("project_id") == pid), None)
+    if proj is None or profile is None:
+        return proj
+    from api.profiles import _profiles_match
+    if not _profiles_match(proj.get("profile"), profile):
+        return None
+    return proj
+
+
+def load_project_memory(project_id) -> str:
+    """Read a project's shared memory file.
+
+    Returns "" when the id is invalid, the file is missing/unreadable, or the
+    path is a symlink (fail closed — a planted link must not pull an arbitrary
+    host file into a session's prompt).
+    """
+    try:
+        path = project_memory_path(project_id)
+    except ValueError:
+        return ""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def project_memory_mtime(project_id):
+    """Return the memory file's mtime, or None when absent/symlinked."""
+    try:
+        path = project_memory_path(project_id)
+    except ValueError:
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def save_project_memory(project_id, content: str) -> Path:
+    """Write a project's shared memory file, creating the store dir as needed."""
+    path = project_memory_path(project_id)
+    PROJECT_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(content), encoding="utf-8")
+    return path
+
+
+def delete_project_memory(project_id) -> bool:
+    """Best-effort removal of a project's shared memory file.
+
+    Returns True when a file was removed. Never raises for a missing file or an
+    invalid id — project deletion must not fail on memory cleanup.
+    """
+    try:
+        path = project_memory_path(project_id)
+    except ValueError:
+        return False
+    if path.is_symlink():
+        return False
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.debug("Failed to delete project shared memory %s", path, exc_info=True)
+        return False
 
 
 CRON_PROJECT_NAME = 'Cron Jobs'

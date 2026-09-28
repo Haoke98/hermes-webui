@@ -113,6 +113,12 @@ SESSION_INDEX_FILE = SESSION_DIR / "_index.json"
 SETTINGS_FILE = _resolve_settings_file(STATE_DIR)
 LAST_WORKSPACE_FILE = STATE_DIR / "last_workspace.txt"
 PROJECTS_FILE = STATE_DIR / "projects.json"
+# Per-project shared memory: one UTF-8 Markdown file per project_id
+# (``project_memory/<project_id>.md``). WebUI-owned data, kept next to
+# projects.json so it shares the project's lifecycle and never lands inside a
+# user workspace/repo. Read per chat turn for prompt injection and read/written
+# by the Memory panel.
+PROJECT_MEMORY_DIR = STATE_DIR / "project_memory"
 
 logger = logging.getLogger(__name__)
 
