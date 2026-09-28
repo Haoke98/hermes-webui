@@ -182,7 +182,8 @@ thread. The Handler class subclasses BaseHTTPRequestHandler with two methods:
                       /api/session/worktree/status
     do_POST   Routes: /api/upload, /api/session/new, /api/session/update,
                       /api/session/delete, /api/chat/start, /api/chat,
-                      /api/approval/respond, /api/session/worktree/remove
+                      /api/approval/respond, /api/session/worktree/remove,
+                      /api/projects/update
 
 Routing is a flat if/elif chain inside each method. No routing framework.
 
@@ -1525,6 +1526,42 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /api/crons/run             {job_id} -> triggers run in daemon thread. Returns {ok, status}.
     /api/crons/pause           {job_id} -> {ok, job} or 404.
     /api/crons/resume          {job_id} -> {ok, job} or 404.
+
+### Endpoints Added in the Project Workspace / Shared Memory Feature (2026-09)
+
+    /api/projects/update       {project_id, name?, color?, workspace?, model?,
+                                model_provider?, personality?, clear_workspace?}
+                                -> {ok, project, workspace_registered}. Absent keys stay
+                                untouched; workspace: null (or clear_workspace: true) clears
+                                the field. A valid workspace is idempotently registered in
+                                the active profile's workspace list, which is what makes
+                                resolve_trusted_workspace accept it for the project's new
+                                sessions. Missing project_id -> 400, unknown or
+                                foreign-profile project -> 404.
+    /api/session/new           (extended) inherits the project's workspace / model /
+                                model_provider / personality into NEW sessions; explicit
+                                request values always win. An unusable project workspace
+                                falls back to the pre-existing chain and adds
+                                workspace_fallback {reason, used}; a project_id that cannot
+                                be honored adds project_warning. Session creation is never
+                                blocked by project attributes.
+    /api/memory                (extended) adds project_memory, project_memory_path,
+                                project_memory_mtime, project_memory_project_id and
+                                project_memory_project_name for the session's project
+                                (all empty when the session is not in one).
+    /api/memory/write          New section "project_memory" {project_id, content} writes
+                                STATE_DIR/project_memory/<project_id>.md. Invalid id -> 400,
+                                unknown / foreign-profile project -> 404, symlinked target
+                                -> 400 (same hardened rule as MEMORY.md/USER.md/SOUL.md).
+    /api/projects/delete       (extended) best-effort removes the project's shared memory
+                                file; cleanup failure only logs.
+
+Project shared memory is injected into the per-turn ephemeral system prompt
+(api/streaming.py `_webui_project_context_block`) for BOTH chat backends — the local
+agent path in `_run_agent_streaming` and the gateway path in api/gateway_chat.py — so an
+edit applies to the next message in every session of the project. The block is appended
+LAST in the ephemeral prompt (stable prefix first) and any read failure degrades to "no
+injection" instead of failing the turn.
 
 ---
 
