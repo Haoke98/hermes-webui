@@ -10786,6 +10786,13 @@ from api.models import (
     _active_state_db_path,
     load_projects,
     save_projects,
+    find_project,
+    load_project_memory,
+    save_project_memory,
+    delete_project_memory,
+    project_memory_path,
+    project_memory_mtime,
+    is_safe_project_id,
     import_cli_session,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
@@ -15905,12 +15912,72 @@ def handle_post(handler, parsed) -> bool:
             handler, workspace_prev_session_id, emit_error=False
         ):
             workspace_prev_session_id = None
-        try:
-            workspace = _resolve_new_session_workspace(
-                body, workspace_prev_session_id, profile=body.get("profile") or None
-            )
-        except (TypeError, ValueError) as e:
-            return bad(handler, str(e))
+        _request_profile = body.get("profile") or None
+        # ── Project inheritance (WebUI project chips) ─────────────────────────
+        # A project may carry a workspace / model / provider / personality that
+        # every NEW session in it inherits. Explicit request values always win,
+        # and a project attribute that cannot be used must NEVER block session
+        # creation: it degrades to the pre-existing chain and is reported back.
+        project = None
+        project_warning = None
+        _requested_project_id = body.get("project_id") or None
+        if _requested_project_id:
+            try:
+                _candidate_project = find_project(
+                    _requested_project_id, projects=load_projects()
+                )
+            except Exception:
+                _candidate_project = None
+            if _candidate_project is None:
+                project_warning = "project not found"
+            else:
+                try:
+                    _owner_ok = _profiles_match(
+                        _candidate_project.get("profile"),
+                        _request_profile or get_active_profile_name(),
+                    )
+                except Exception:
+                    _owner_ok = False
+                if _owner_ok:
+                    project = _candidate_project
+                else:
+                    project_warning = "project belongs to another profile"
+
+        def _resolve_project_workspace(value):
+            # Legacy test doubles may predate the profile kwarg.
+            try:
+                return resolve_trusted_workspace(value, profile=_request_profile)
+            except TypeError:
+                return resolve_trusted_workspace(value)
+
+        workspace = None
+        workspace_fallback = None
+        _project_ws_error = None
+        if not body.get("workspace") and project and project.get("workspace"):
+            try:
+                workspace = str(_resolve_project_workspace(project["workspace"]))
+            except (TypeError, ValueError) as e:
+                # Deleted / untrusted / system-rooted project workspace: fall
+                # back instead of failing (see 技术方案 §3.2-B5).
+                _project_ws_error = str(e)
+        if workspace is None:
+            try:
+                workspace = _resolve_new_session_workspace(
+                    body, workspace_prev_session_id, profile=_request_profile
+                )
+            except (TypeError, ValueError) as e:
+                return bad(handler, str(e))
+            if _project_ws_error:
+                _fallback_used = workspace
+                if not _fallback_used:
+                    try:
+                        _fallback_used = get_last_workspace(profile=_request_profile)
+                    except TypeError:
+                        _fallback_used = get_last_workspace()
+                workspace_fallback = {
+                    "reason": _project_ws_error,
+                    "used": str(_fallback_used or ""),
+                }
         worktree_info = None
         worktree_skipped = None
         # Three-value worktree model (#6022): an explicit body value always
@@ -15963,9 +16030,17 @@ def handle_post(handler, parsed) -> bool:
             except Exception as e:
                 logger.exception("failed to create worktree-backed session")
                 return bad(handler, f"Failed to create worktree: {e}", status=500)
+        _requested_model = body.get("model")
+        _requested_model_provider = body.get("model_provider")
+        if project and not _requested_model and project.get("model"):
+            # Project default model/provider — an explicit composer override
+            # (body["model"]) always wins; the project only fills the gap.
+            _requested_model = project.get("model")
+            if not _requested_model_provider and project.get("model_provider"):
+                _requested_model_provider = project.get("model_provider")
         model, model_provider = _session_model_state_from_request(
-            body.get("model"),
-            body.get("model_provider"),
+            _requested_model,
+            _requested_model_provider,
         )
         try:
             enabled_toolsets = _validate_session_toolsets_shape(body.get("enabled_toolsets"))
@@ -16035,6 +16110,7 @@ def handle_post(handler, parsed) -> bool:
             project_id=body.get("project_id") or None,
             worktree_info=worktree_info,
             enabled_toolsets=enabled_toolsets,
+            personality=(project.get("personality") if project else None),
         )
         if worktree_info:
             publish_session_list_changed(
@@ -16049,6 +16125,15 @@ def handle_post(handler, parsed) -> bool:
             # Config-default worktree was skipped (non-git workspace); tell the
             # client the session is plain so the UI doesn't assume isolation.
             payload["worktree_skipped"] = worktree_skipped
+        if workspace_fallback:
+            # The project workspace could not be used; the session was created
+            # with a fallback instead (client shows a non-blocking notice).
+            payload["workspace_fallback"] = workspace_fallback
+        if project_warning:
+            # A project_id was sent but could not be honored (not found / owned
+            # by another profile): the session was created without project
+            # inheritance.
+            payload["project_warning"] = project_warning
         return j(handler, payload)
 
     if parsed.path == "/api/session/compression-recovery/start":
@@ -17910,6 +17995,9 @@ def handle_post(handler, parsed) -> bool:
         save_projects(projects)
         return j(handler, {"ok": True, "project": proj})
 
+    if parsed.path == "/api/projects/update":
+        return _handle_project_update(handler, body)
+
     if parsed.path == "/api/projects/delete":
         try:
             require(body, "project_id")
@@ -17976,6 +18064,15 @@ def handle_post(handler, parsed) -> bool:
                     )
             except Exception:
                 logger.debug("Failed to load session index for project unlink")
+        # Best-effort: drop the project's shared memory together with the
+        # project itself. Cleanup failure only logs — deleting the project must
+        # not fail because of it (same style as the unassign loop above).
+        try:
+            delete_project_memory(body["project_id"])
+        except Exception:
+            logger.debug(
+                "Failed to delete project shared memory for %s", body["project_id"]
+            )
         return j(handler, {"ok": True})
 
     # ── Session import from JSON (POST) ──
@@ -22944,6 +23041,57 @@ def _read_active_project_context(workspace: Path | None) -> dict:
     return payload
 
 
+def _memory_project_memory_payload(parsed) -> dict:
+    """Resolve the project-scoped shared memory for the session in the query.
+
+    Mirrors the injection rule used at chat time (api/streaming.py
+    ``_webui_project_context_block``): the session's own profile must own the
+    project, otherwise every field stays empty (fail closed — no existence
+    leak for a foreign project id).
+    """
+    empty = {
+        "project_memory": "",
+        "project_memory_path": "",
+        "project_memory_mtime": None,
+        "project_memory_project_id": "",
+        "project_memory_project_name": "",
+    }
+    qs = parse_qs(parsed.query or "") if parsed is not None else {}
+    sid = qs.get("session_id", [""])[0]
+    if not sid:
+        return empty
+    try:
+        session = get_session(sid)
+    except Exception:
+        return empty
+    project_id = getattr(session, "project_id", None)
+    if not project_id or not is_safe_project_id(project_id):
+        return empty
+    try:
+        proj = find_project(project_id, projects=load_projects())
+    except Exception:
+        return empty
+    if not proj:
+        return empty
+    session_profile = getattr(session, "profile", None) or get_active_profile_name()
+    try:
+        if not _profiles_match(proj.get("profile"), session_profile):
+            return empty
+    except Exception:
+        return empty
+    try:
+        mem_path = project_memory_path(project_id)
+    except ValueError:
+        return empty
+    return {
+        "project_memory": _redact_text(load_project_memory(project_id)),
+        "project_memory_path": str(mem_path),
+        "project_memory_mtime": project_memory_mtime(project_id),
+        "project_memory_project_id": str(project_id),
+        "project_memory_project_name": str(proj.get("name") or ""),
+    }
+
+
 def _handle_memory_read(handler, parsed=None):
     try:
         from api.profiles import get_active_hermes_home
@@ -22983,6 +23131,7 @@ def _handle_memory_read(handler, parsed=None):
         else ""
     )
     project_context = _read_active_project_context(_memory_project_context_workspace(parsed))
+    project_memory_fields = _memory_project_memory_payload(parsed)
     return j(
         handler,
         {
@@ -23002,6 +23151,14 @@ def _handle_memory_read(handler, parsed=None):
             "project_context_mtime": project_context["mtime"],
             "project_context_shadowed": project_context["shadowed"],
             "external_notes_enabled": _external_notes_sources_enabled(cfg),
+            # Project-scoped shared memory (WebUI-owned, one file per project;
+            # injected per turn for every session in the project). Empty when
+            # the session is not in a project or the project is not ours.
+            "project_memory": project_memory_fields["project_memory"],
+            "project_memory_path": project_memory_fields["project_memory_path"],
+            "project_memory_mtime": project_memory_fields["project_memory_mtime"],
+            "project_memory_project_id": project_memory_fields["project_memory_project_id"],
+            "project_memory_project_name": project_memory_fields["project_memory_project_name"],
         },
     )
 
@@ -26895,6 +27052,120 @@ def _handle_workspace_reorder(handler, body):
     return j(handler, {"ok": True, "workspaces": reordered})
 
 
+def _register_workspace_for_profile(path_obj, profile) -> bool:
+    """Idempotently add *path_obj* to *profile*'s saved workspace list.
+
+    Returns True when a new entry was appended, False when the path was already
+    registered. Mirrors the list-write half of ``_handle_workspace_add`` without
+    refactoring that handler (its behaviour is pinned by existing tests). This
+    registration is what makes ``resolve_trusted_workspace`` accept the path for
+    the project's new sessions (rule B, api/workspace.py).
+    """
+    try:
+        wss = load_workspaces(profile=profile)
+    except TypeError:
+        wss = load_workspaces()
+    if any(str(w.get("path") or "") == str(path_obj) for w in wss):
+        return False
+    wss.append({"path": str(path_obj), "name": path_obj.name})
+    try:
+        save_workspaces(wss, profile=profile)
+    except TypeError:
+        save_workspaces(wss)
+    return True
+
+
+_PROJECT_NAME_MAX_CHARS = 128
+_PROJECT_MODEL_MAX_CHARS = 128
+_PROJECT_PROVIDER_MAX_CHARS = 64
+_PROJECT_PERSONALITY_MAX_CHARS = 64
+
+
+def _handle_project_update(handler, body):
+    """Update project attributes: name / color / workspace / model / personality.
+
+    Semantics (see docs/二开设计/技术方案.md §3.2-B1):
+      * a key that is ABSENT from the body is left untouched;
+      * ``workspace: null`` (or ``clear_workspace: true``) clears the field;
+      * a valid workspace is idempotently registered in the active profile's
+        workspace list so new sessions in the project may use it.
+
+    Only the profile that owns the project may update it (404 otherwise, same
+    fail-closed convention as /api/projects/rename|delete).
+    """
+    try:
+        require(body, "project_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    projects = load_projects()
+    proj = next(
+        (p for p in projects if p.get("project_id") == body["project_id"]), None
+    )
+    if not proj:
+        return bad(handler, "Project not found", 404)
+    # #1614: a project can only be edited by the profile that owns it.
+    active_profile = get_active_profile_name()
+    if not _profiles_match(proj.get("profile"), active_profile):
+        return bad(handler, "Project not found", 404)
+
+    import re as _re
+
+    if "name" in body:
+        name = str(body.get("name") or "").strip()[:_PROJECT_NAME_MAX_CHARS]
+        if not name:
+            return bad(handler, "name required")
+        proj["name"] = name
+
+    if "color" in body:
+        color = body.get("color")
+        if color and not _re.match(r"^#[0-9a-fA-F]{3,8}$", color):
+            return bad(handler, "Invalid color format")
+        proj["color"] = color
+
+    workspace_registered = False
+    if bool(body.get("clear_workspace")) or "workspace" in body:
+        raw_ws = "" if bool(body.get("clear_workspace")) else body.get("workspace")
+        raw_ws = str(raw_ws).strip() if raw_ws else ""
+        if not raw_ws:
+            # Explicit clear: new sessions fall back to the pre-existing chain.
+            proj["workspace"] = None
+        else:
+            try:
+                ws_path = validate_workspace_to_add(_strip_surrounding_quotes(raw_ws), profile=active_profile)
+            except (ValueError, OSError) as e:
+                return bad(handler, str(e))
+            proj["workspace"] = str(ws_path)
+            # Registration is what makes the path trusted for the project's
+            # sessions (resolve_trusted_workspace rule B). Failure to register
+            # must not lose the saved attribute, so it is reported, not raised.
+            try:
+                workspace_registered = _register_workspace_for_profile(ws_path, active_profile)
+            except Exception:
+                logger.debug("Failed to register project workspace %s", ws_path, exc_info=True)
+
+    for field, limit in (
+        ("model", _PROJECT_MODEL_MAX_CHARS),
+        ("model_provider", _PROJECT_PROVIDER_MAX_CHARS),
+        ("personality", _PROJECT_PERSONALITY_MAX_CHARS),
+    ):
+        if field not in body:
+            continue
+        value = body.get(field)
+        if value is None:
+            proj[field] = None
+            continue
+        if not isinstance(value, str) or len(value.strip()) > limit:
+            return bad(handler, f"invalid {field}")
+        proj[field] = value.strip() or None
+
+    proj["updated_at"] = time.time()
+    save_projects(projects)
+    return j(
+        handler,
+        {"ok": True, "project": proj, "workspace_registered": workspace_registered},
+    )
+
+
 def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: str = "") -> bool:
     """Resolve an approval through the existing callback path.
 
@@ -29099,12 +29370,75 @@ def _handle_skill_toggle(handler, body):
     return j(handler, {"ok": True, "name": name, "enabled": enabled})
 
 
+def _handle_project_memory_write(handler, body):
+    """Write the shared memory of the project named in the request body.
+
+    Storage: ``PROJECT_MEMORY_DIR/<project_id>.md`` (api/models.py). Only a
+    project owned by the ACTIVE profile may be written — a foreign id reads as
+    "Project not found" (fail closed, same convention as
+    /api/projects/rename|delete). The id shape is validated before any
+    filesystem access, so it can never traverse out of the store directory.
+    """
+    project_id = body.get("project_id")
+    project_id = "" if project_id is None else str(project_id).strip()
+    if not project_id:
+        return bad(handler, "project_id is required")
+    if not is_safe_project_id(project_id):
+        return bad(handler, "invalid project_id")
+    content = body.get("content")
+    if not isinstance(content, str):
+        return bad(handler, "content must be a string")
+    try:
+        proj = find_project(project_id, projects=load_projects(), profile=get_active_profile_name())
+    except Exception:
+        proj = None
+    if not proj:
+        return bad(handler, "Project not found", 404)
+    try:
+        target = project_memory_path(project_id)
+    except ValueError:
+        return bad(handler, "invalid project_id")
+    # Same hardened rule as MEMORY.md/USER.md/SOUL.md: never write through a
+    # symlinked target — a symlink planted at the memory path would otherwise
+    # let the write clobber an arbitrary file outside the store directory.
+    if target.is_symlink():
+        return bad(handler, "Cannot write to a symlinked memory file")
+    try:
+        save_project_memory(project_id, content)
+    except OSError as exc:
+        if not isinstance(exc, PermissionError) and getattr(exc, "errno", None) != errno.EROFS:
+            raise
+        return bad(
+            handler,
+            (
+                f"{target.name} is not writable: {target}. "
+                "Fix ownership/permissions on the WebUI state directory."
+            ),
+            403,
+        )
+    return j(
+        handler,
+        {
+            "ok": True,
+            "section": "project_memory",
+            "path": str(target),
+            "mtime": project_memory_mtime(project_id),
+        },
+    )
+
+
 def _handle_memory_write(handler, body):
     try:
         require(body, "section", "content")
     except ValueError as e:
         return bad(handler, str(e))
     section = body["section"]
+
+    # Project shared memory is WebUI-owned data, not part of the agent memory
+    # system: it is deliberately NOT gated by memory_enabled /
+    # user_profile_enabled and lives under STATE_DIR (not the agent home).
+    if section == "project_memory":
+        return _handle_project_memory_write(handler, body)
 
     # Respect memory_enabled and user_profile_enabled config flags (#6406)
     # Use get_config_snapshot() for per-profile isolation — get_config() returns
@@ -29136,7 +29470,7 @@ def _handle_memory_write(handler, body):
     elif section == "soul":
         target = home / "SOUL.md"
     else:
-        return bad(handler, 'section must be "memory", "user", or "soul"')
+        return bad(handler, 'section must be "memory", "user", "soul", or "project_memory"')
     # Refuse to write through a symlinked target file: a symlink planted at the
     # memory path (e.g. via a restored/imported workspace) would otherwise let a
     # memory write clobber an arbitrary file outside the memories directory. This
